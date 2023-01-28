@@ -1,6 +1,7 @@
 use crate::common::*;
 use crate::database;
 use hbb_common::{
+    bytes::Bytes,
     log,
     rendezvous_proto::*,
     tokio::sync::{Mutex, RwLock},
@@ -9,10 +10,13 @@ use hbb_common::{
 use serde_derive::{Deserialize, Serialize};
 use std::{collections::HashMap, collections::HashSet, net::SocketAddr, sync::Arc, time::Instant};
 
+type IpBlockMap = HashMap<String, ((u32, Instant), (HashSet<String>, Instant))>;
+type UserStatusMap = HashMap<Vec<u8>, Arc<(Option<Vec<u8>>, bool)>>;
+type IpChangesMap = HashMap<String, (Instant, HashMap<String, i32>)>;
 lazy_static::lazy_static! {
-    pub(crate) static ref IP_BLOCKER: Mutex<HashMap<String, ((u32, Instant), (HashSet<String>, Instant))>> = Default::default();
-    pub(crate) static ref USER_STATUS: RwLock<HashMap<Vec<u8>, Arc<(Option<Vec<u8>>, bool)>>> = Default::default();
-    pub(crate) static ref IP_CHANGES: Mutex<HashMap<String, (Instant, HashMap<String, i32>)>> = Default::default();
+    pub(crate) static ref IP_BLOCKER: Mutex<IpBlockMap> = Default::default();
+    pub(crate) static ref USER_STATUS: RwLock<UserStatusMap> = Default::default();
+    pub(crate) static ref IP_CHANGES: Mutex<IpChangesMap> = Default::default();
 }
 pub static IP_CHANGE_DUR: u64 = 180;
 pub static IP_CHANGE_DUR_X2: u64 = IP_CHANGE_DUR * 2;
@@ -25,16 +29,15 @@ pub(crate) struct PeerInfo {
     pub(crate) ip: String,
 }
 
-#[derive(Clone, Debug)]
 pub(crate) struct Peer {
     pub(crate) socket_addr: SocketAddr,
     pub(crate) last_reg_time: Instant,
     pub(crate) guid: Vec<u8>,
-    pub(crate) uuid: Vec<u8>,
-    pub(crate) pk: Vec<u8>,
-    pub(crate) user: Option<Vec<u8>>,
+    pub(crate) uuid: Bytes,
+    pub(crate) pk: Bytes,
+    // pub(crate) user: Option<Vec<u8>>,
     pub(crate) info: PeerInfo,
-    pub(crate) disabled: bool,
+    // pub(crate) disabled: bool,
     pub(crate) reg_pk: (u32, Instant), // how often register_pk
 }
 
@@ -44,11 +47,11 @@ impl Default for Peer {
             socket_addr: "0.0.0.0:0".parse().unwrap(),
             last_reg_time: get_expired_time(),
             guid: Vec::new(),
-            uuid: Vec::new(),
-            pk: Vec::new(),
+            uuid: Bytes::new(),
+            pk: Bytes::new(),
             info: Default::default(),
-            user: None,
-            disabled: false,
+            // user: None,
+            // disabled: false,
             reg_pk: (0, get_expired_time()),
         }
     }
@@ -65,7 +68,6 @@ pub(crate) struct PeerMap {
 impl PeerMap {
     pub(crate) async fn new() -> ResultType<Self> {
         let db = std::env::var("DB_URL").unwrap_or({
-            #[allow(unused_mut)]
             let mut db = "db_v2.sqlite3".to_owned();
             #[cfg(all(windows, not(debug_assertions)))]
             {
@@ -93,8 +95,8 @@ impl PeerMap {
         id: String,
         peer: LockPeer,
         addr: SocketAddr,
-        uuid: Vec<u8>,
-        pk: Vec<u8>,
+        uuid: Bytes,
+        pk: Bytes,
         ip: String,
     ) -> register_pk_response::Result {
         log::info!("update_pk {} {:?} {:?} {:?}", id, addr, uuid, pk);
@@ -132,24 +134,22 @@ impl PeerMap {
 
     #[inline]
     pub(crate) async fn get(&self, id: &str) -> Option<LockPeer> {
-        let p = self.map.read().await.get(id).map(|x| x.clone());
+        let p = self.map.read().await.get(id).cloned();
         if p.is_some() {
             return p;
-        } else {
-            if let Ok(Some(v)) = self.db.get_peer(id).await {
-                let peer = Peer {
-                    guid: v.guid,
-                    uuid: v.uuid,
-                    pk: v.pk,
-                    user: v.user,
-                    info: serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default(),
-                    disabled: v.status == Some(0),
-                    ..Default::default()
-                };
-                let peer = Arc::new(RwLock::new(peer));
-                self.map.write().await.insert(id.to_owned(), peer.clone());
-                return Some(peer);
-            }
+        } else if let Ok(Some(v)) = self.db.get_peer(id).await {
+            let peer = Peer {
+                guid: v.guid,
+                uuid: v.uuid.into(),
+                pk: v.pk.into(),
+                // user: v.user,
+                info: serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default(),
+                // disabled: v.status == Some(0),
+                ..Default::default()
+            };
+            let peer = Arc::new(RwLock::new(peer));
+            self.map.write().await.insert(id.to_owned(), peer.clone());
+            return Some(peer);
         }
         None
     }
@@ -170,16 +170,11 @@ impl PeerMap {
 
     #[inline]
     pub(crate) async fn get_in_memory(&self, id: &str) -> Option<LockPeer> {
-        self.map.read().await.get(id).map(|x| x.clone())
+        self.map.read().await.get(id).cloned()
     }
 
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
-    }
-
-    #[inline]
-    pub(crate) async fn remove(&self, id: &str) {
-        self.map.write().await.remove(id);
     }
 }

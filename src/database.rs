@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use hbb_common::{log, ResultType};
-use serde_json::value::Value;
 use sqlx::{
     sqlite::SqliteConnectOptions, ConnectOptions, Connection, Error as SqlxError, SqliteConnection,
 };
@@ -8,9 +7,6 @@ use std::{ops::DerefMut, str::FromStr};
 //use sqlx::postgres::PgPoolOptions;
 //use sqlx::mysql::MySqlPoolOptions;
 
-pub(crate) type DB = sqlx::Sqlite;
-pub(crate) type MapValue = serde_json::map::Map<String, Value>;
-pub(crate) type MapStr = std::collections::HashMap<String, String>;
 type Pool = deadpool::managed::Pool<DbPool>;
 
 pub struct DbPool {
@@ -56,7 +52,7 @@ impl Database {
             std::fs::File::create(url).ok();
         }
         let n: usize = std::env::var("MAX_DATABASE_CONNECTIONS")
-            .unwrap_or("1".to_owned())
+            .unwrap_or_else(|_| "1".to_owned())
             .parse()
             .unwrap_or(1);
         log::debug!("MAX_DATABASE_CONNECTIONS={}", n);
@@ -107,36 +103,11 @@ impl Database {
         .await?)
     }
 
-    pub async fn get_peer_id(&self, guid: &[u8]) -> ResultType<Option<String>> {
-        Ok(sqlx::query!("select id from peer where guid = ?", guid)
-            .fetch_optional(self.pool.get().await?.deref_mut())
-            .await?
-            .map(|x| x.id))
-    }
-
-    #[inline]
-    pub async fn get_conn(&self) -> ResultType<deadpool::managed::Object<DbPool>> {
-        Ok(self.pool.get().await?)
-    }
-
-    pub async fn update_peer(&self, payload: MapValue, guid: &[u8]) -> ResultType<()> {
-        let mut conn = self.get_conn().await?;
-        let mut tx = conn.begin().await?;
-        if let Some(v) = payload.get("note") {
-            let v = get_str(v);
-            sqlx::query!("update peer set note = ? where guid = ?", v, guid)
-                .execute(&mut tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
     pub async fn insert_peer(
         &self,
         id: &str,
-        uuid: &Vec<u8>,
-        pk: &Vec<u8>,
+        uuid: &[u8],
+        pk: &[u8],
         info: &str,
     ) -> ResultType<Vec<u8>> {
         let guid = uuid::Uuid::new_v4().as_bytes().to_vec();
@@ -157,7 +128,7 @@ impl Database {
         &self,
         guid: &Vec<u8>,
         id: &str,
-        pk: &Vec<u8>,
+        pk: &[u8],
         info: &str,
     ) -> ResultType<()> {
         sqlx::query!(
@@ -206,26 +177,5 @@ mod tests {
             jobs.push(a);
         }
         hbb_common::futures::future::join_all(jobs).await;
-    }
-}
-
-#[inline]
-pub fn guid2str(guid: &Vec<u8>) -> String {
-    let mut bytes = [0u8; 16];
-    bytes[..].copy_from_slice(&guid);
-    uuid::Uuid::from_bytes(bytes).to_string()
-}
-
-pub(crate) fn get_str(v: &Value) -> Option<&str> {
-    match v {
-        Value::String(v) => {
-            let v = v.trim();
-            if v.is_empty() {
-                None
-            } else {
-                Some(v)
-            }
-        }
-        _ => None,
     }
 }

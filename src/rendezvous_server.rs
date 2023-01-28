@@ -4,6 +4,7 @@ use hbb_common::{
     allow_err,
     bytes::{Bytes, BytesMut},
     bytes_codec::BytesCodec,
+    config,
     futures::future::join_all,
     futures_util::{
         sink::SinkExt,
@@ -15,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{new_listener, FramedStream},
+    tcp::{listen_any, FramedStream},
     timeout,
     tokio::{
         self,
@@ -25,13 +26,15 @@ use hbb_common::{
         time::{interval, Duration},
     },
     tokio_util::codec::Framed,
+    try_into_v4,
     udp::FramedSocket,
     AddrMangle, ResultType,
 };
+use ipnetwork::Ipv4Network;
 use sodiumoxide::crypto::sign;
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Instant,
 };
@@ -39,7 +42,7 @@ const ADDR_127: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 
 #[derive(Clone, Debug)]
 enum Data {
-    Msg(RendezvousMessage, SocketAddr),
+    Msg(Box<RendezvousMessage>, SocketAddr),
     RelayServers0(String),
     RelayServers(RelayServers),
 }
@@ -59,17 +62,24 @@ static CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static mut ALWAYS_USE_RELAY: bool = false;
 
 #[derive(Clone)]
+struct Inner {
+    serial: i32,
+    version: String,
+    software_url: String,
+    mask: Option<Ipv4Network>,
+    local_ip: String,
+    sk: Option<sign::SecretKey>,
+}
+
+#[derive(Clone)]
 pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
     relay_servers0: Arc<RelayServers>,
-    serial: i32,
     rendezvous_servers: Arc<Vec<String>>,
-    version: String,
-    software_url: String,
-    sk: Option<sign::SecretKey>,
+    inner: Arc<Inner>,
 }
 
 enum LoopFailure {
@@ -81,47 +91,58 @@ enum LoopFailure {
 
 impl RendezvousServer {
     #[tokio::main(flavor = "multi_thread")]
-    pub async fn start(
-        port: i32,
-        serial: i32,
-        key: &str,
-        rmem: usize,
-    ) -> ResultType<()> {
+    pub async fn start(port: i32, serial: i32, key: &str, rmem: usize) -> ResultType<()> {
+        let (key, sk) = Self::get_server_sk(key);
         let addr = format!("0.0.0.0:{}", port);
-        let addr2 = format!("0.0.0.0:{}", port - 1);
-        let addr3 = format!("0.0.0.0:{}", port + 2);
+        let nat_port = port - 1;
+        let ws_port = port + 2;
         let pm = PeerMap::new().await?;
         log::info!("serial={}", serial);
         let rendezvous_servers = get_servers(&get_arg("rendezvous-servers"), "rendezvous-servers");
-        log::info!("Listening on tcp/udp {}", addr);
-        log::info!("Listening on tcp {}, extra port for NAT test", addr2);
-        log::info!("Listening on websocket {}", addr3);
-        let mut socket = FramedSocket::new_with_buf_size(&addr, rmem).await?;
+        log::info!("Listening on tcp/udp :{}", port);
+        log::info!("Listening on tcp :{}, extra port for NAT test", nat_port);
+        log::info!("Listening on websocket :{}", ws_port);
+        let mut socket = create_udp_listener(port, rmem).await?;
         let (tx, mut rx) = mpsc::unbounded_channel::<Data>();
         let software_url = get_arg("software-url");
         let version = hbb_common::get_version_from_url(&software_url);
         if !version.is_empty() {
             log::info!("software_url: {}, version: {}", software_url, version);
         }
+        let mask = get_arg("mask").parse().ok();
+        let local_ip = if mask.is_none() {
+            "".to_owned()
+        } else {
+            get_arg_or(
+                "local-ip",
+                local_ip_address::local_ip()
+                    .map(|x| x.to_string())
+                    .unwrap_or_default(),
+            )
+        };
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
             relay_servers0: Default::default(),
-            serial,
             rendezvous_servers: Arc::new(rendezvous_servers),
-            version,
-            software_url,
-            sk: None,
+            inner: Arc::new(Inner {
+                serial,
+                version,
+                software_url,
+                sk,
+                mask,
+                local_ip,
+            }),
         };
-        let key = rs.get_server_sk(key);
+        log::info!("mask: {:?}", rs.inner.mask);
+        log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
-        let pm = rs.pm.clone();
-        let mut listener = new_listener(&addr, false).await?;
-        let mut listener2 = new_listener(&addr2, false).await?;
-        let mut listener3 = new_listener(&addr3, false).await?;
+        let mut listener = create_tcp_listener(port).await?;
+        let mut listener2 = create_tcp_listener(nat_port).await?;
+        let mut listener3 = create_tcp_listener(ws_port).await?;
         let test_addr = std::env::var("TEST_HBBS").unwrap_or_default();
         if std::env::var("ALWAYS_USE_RELAY")
             .unwrap_or_default()
@@ -151,37 +172,44 @@ impl RendezvousServer {
                 allow_err!(test_hbbs(test_addr).await);
             });
         };
-        loop {
-            log::info!("Start");
-            match rs
-                .io_loop(
-                    &mut rx,
-                    &mut listener,
-                    &mut listener2,
-                    &mut listener3,
-                    &mut socket,
-                    &key,
-                )
-                .await
-            {
-                LoopFailure::UdpSocket => {
-                    drop(socket);
-                    socket = FramedSocket::new_with_buf_size(&addr, rmem).await?;
-                }
-                LoopFailure::Listener => {
-                    drop(listener);
-                    listener = new_listener(&addr, false).await?;
-                }
-                LoopFailure::Listener2 => {
-                    drop(listener2);
-                    listener2 = new_listener(&addr2, false).await?;
-                }
-                LoopFailure::Listener3 => {
-                    drop(listener3);
-                    listener3 = new_listener(&addr3, false).await?;
+        let main_task = async move {
+            loop {
+                log::info!("Start");
+                match rs
+                    .io_loop(
+                        &mut rx,
+                        &mut listener,
+                        &mut listener2,
+                        &mut listener3,
+                        &mut socket,
+                        &key,
+                    )
+                    .await
+                {
+                    LoopFailure::UdpSocket => {
+                        drop(socket);
+                        socket = create_udp_listener(port, rmem).await?;
+                    }
+                    LoopFailure::Listener => {
+                        drop(listener);
+                        listener = create_tcp_listener(port).await?;
+                    }
+                    LoopFailure::Listener2 => {
+                        drop(listener2);
+                        listener2 = create_tcp_listener(nat_port).await?;
+                    }
+                    LoopFailure::Listener3 => {
+                        drop(listener3);
+                        listener3 = create_tcp_listener(ws_port).await?;
+                    }
                 }
             }
-        }
+        };
+        let listen_signal = listen_signal();
+        tokio::select!(
+            res = main_task => res,
+            res = listen_signal => res,
+        )
     }
 
     async fn io_loop(
@@ -207,7 +235,7 @@ impl RendezvousServer {
                 }
                 Some(data) = rx.recv() => {
                     match data {
-                        Data::Msg(msg, addr) => { allow_err!(socket.send(&msg, addr).await); }
+                        Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
                         Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
                         Data::RelayServers(rs) => { self.relay_servers = Arc::new(rs); }
                     }
@@ -277,17 +305,17 @@ impl RendezvousServer {
         socket: &mut FramedSocket,
         key: &str,
     ) -> ResultType<()> {
-        if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
+        if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
-                Some(rendezvous_message::Union::register_peer(rp)) => {
+                Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     // B registered
-                    if rp.id.len() > 0 {
+                    if !rp.id.is_empty() {
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
                         self.update_addr(rp.id, addr, socket).await?;
-                        if self.serial > rp.serial {
+                        if self.inner.serial > rp.serial {
                             let mut msg_out = RendezvousMessage::new();
                             msg_out.set_configure_update(ConfigUpdate {
-                                serial: self.serial,
+                                serial: self.inner.serial,
                                 rendezvous_servers: (*self.rendezvous_servers).clone(),
                                 ..Default::default()
                             });
@@ -295,7 +323,7 @@ impl RendezvousServer {
                         }
                     }
                 }
-                Some(rendezvous_message::Union::register_pk(rk)) => {
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
                     if rk.uuid.is_empty() || rk.pk.is_empty() {
                         return Ok(());
                     }
@@ -358,12 +386,10 @@ impl RendezvousServer {
                                 *tm = Instant::now();
                                 ips.clear();
                                 ips.insert(ip.clone(), 1);
+                            } else if let Some(v) = ips.get_mut(&ip) {
+                                *v += 1;
                             } else {
-                                if let Some(v) = ips.get_mut(&ip) {
-                                    *v += 1;
-                                } else {
-                                    ips.insert(ip.clone(), 1);
-                                }
+                                ips.insert(ip.clone(), 1);
                             }
                         } else {
                             lock.insert(
@@ -382,7 +408,7 @@ impl RendezvousServer {
                     });
                     socket.send(&msg_out, addr).await?
                 }
-                Some(rendezvous_message::Union::punch_hole_request(ph)) => {
+                Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     if self.pm.is_in_memory(&ph.id).await {
                         self.handle_udp_punch_hole_request(addr, ph, key).await?;
                     } else {
@@ -394,15 +420,17 @@ impl RendezvousServer {
                         });
                     }
                 }
-                Some(rendezvous_message::Union::punch_hole_sent(phs)) => {
+                Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     self.handle_hole_sent(phs, addr, Some(socket)).await?;
                 }
-                Some(rendezvous_message::Union::local_addr(la)) => {
+                Some(rendezvous_message::Union::LocalAddr(la)) => {
                     self.handle_local_addr(la, addr, Some(socket)).await?;
                 }
-                Some(rendezvous_message::Union::configure_update(mut cu)) => {
-                    if addr.ip() == ADDR_127 && cu.serial > self.serial {
-                        self.serial = cu.serial;
+                Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
+                    if addr.ip() == ADDR_127 && cu.serial > self.inner.serial {
+                        let mut inner: Inner = (*self.inner).clone();
+                        inner.serial = cu.serial;
+                        self.inner = Arc::new(inner);
                         self.rendezvous_servers = Arc::new(
                             cu.rendezvous_servers
                                 .drain(..)
@@ -414,16 +442,16 @@ impl RendezvousServer {
                         );
                         log::info!(
                             "configure updated: serial={} rendezvous-servers={:?}",
-                            self.serial,
+                            self.inner.serial,
                             self.rendezvous_servers
                         );
                     }
                 }
-                Some(rendezvous_message::Union::software_update(su)) => {
-                    if !self.version.is_empty() && su.url != self.version {
+                Some(rendezvous_message::Union::SoftwareUpdate(su)) => {
+                    if !self.inner.version.is_empty() && su.url != self.inner.version {
                         let mut msg_out = RendezvousMessage::new();
                         msg_out.set_software_update(SoftwareUpdate {
-                            url: self.software_url.clone(),
+                            url: self.inner.software_url.clone(),
                             ..Default::default()
                         });
                         socket.send(&msg_out, addr).await?;
@@ -444,64 +472,72 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> bool {
-        if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
+        if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
-                Some(rendezvous_message::Union::punch_hole_request(ph)) => {
+                Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(addr, sink);
+                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    allow_err!(self.handle_tcp_punch_hole_request(addr, ph, &key, ws).await);
+                    allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
                     return true;
                 }
-                Some(rendezvous_message::Union::request_relay(mut rf)) => {
+                Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(addr, sink);
+                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
-                        rf.socket_addr = AddrMangle::encode(addr);
+                        rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out, peer_addr)).ok();
+                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
                     }
                     return true;
                 }
-                Some(rendezvous_message::Union::relay_response(mut rr)) => {
+                Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
                     rr.socket_addr = Default::default();
-                    let id = rr.get_id();
+                    let id = rr.id();
                     if !id.is_empty() {
                         let pk = self.get_pk(&rr.version, id.to_owned()).await;
                         rr.set_pk(pk);
                     }
                     let mut msg_out = RendezvousMessage::new();
+                    if !rr.relay_server.is_empty() {
+                        if self.is_lan(addr_b) {
+                            // https://github.com/rustdesk/rustdesk-server/issues/24
+                            rr.relay_server = self.inner.local_ip.clone();
+                        } else if rr.relay_server == self.inner.local_ip {
+                            rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
+                        }
+                    }
                     msg_out.set_relay_response(rr);
                     allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
                 }
-                Some(rendezvous_message::Union::punch_hole_sent(phs)) => {
+                Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
                     allow_err!(self.handle_hole_sent(phs, addr, None).await);
                 }
-                Some(rendezvous_message::Union::local_addr(la)) => {
+                Some(rendezvous_message::Union::LocalAddr(la)) => {
                     allow_err!(self.handle_local_addr(la, addr, None).await);
                 }
-                Some(rendezvous_message::Union::test_nat_request(tar)) => {
+                Some(rendezvous_message::Union::TestNatRequest(tar)) => {
                     let mut msg_out = RendezvousMessage::new();
                     let mut res = TestNatResponse {
                         port: addr.port() as _,
                         ..Default::default()
                     };
-                    if self.serial > tar.serial {
+                    if self.inner.serial > tar.serial {
                         let mut cu = ConfigUpdate::new();
-                        cu.serial = self.serial;
+                        cu.serial = self.inner.serial;
                         cu.rendezvous_servers = (*self.rendezvous_servers).clone();
                         res.cu = MessageField::from_option(Some(cu));
                     }
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::register_pk(_rk)) => {
+                Some(rendezvous_message::Union::RegisterPk(_)) => {
                     let res = register_pk_response::Result::NOT_SUPPORT;
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
@@ -577,7 +613,7 @@ impl RendezvousServer {
         );
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
-            socket_addr: AddrMangle::encode(addr),
+            socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
             ..Default::default()
@@ -634,6 +670,7 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
+        let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -662,15 +699,15 @@ impl RendezvousServer {
                 return Ok((msg_out, None));
             }
             let mut msg_out = RendezvousMessage::new();
-            if unsafe { ALWAYS_USE_RELAY } {
-                let relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
-                if !relay_server.is_empty() {
-                    msg_out.set_request_relay(RequestRelay {
-                        relay_server,
-                        ..Default::default()
-                    });
-                    return Ok((msg_out, Some(peer_addr)));
+            let peer_is_lan = self.is_lan(peer_addr);
+            let is_lan = self.is_lan(addr);
+            let mut relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
+            if unsafe { ALWAYS_USE_RELAY } || (peer_is_lan ^ is_lan) {
+                if peer_is_lan {
+                    // https://github.com/rustdesk/rustdesk-server/issues/24
+                    relay_server = self.inner.local_ip.clone()
                 }
+                ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
             }
             let same_intranet = !ws
                 && match peer_addr {
@@ -683,8 +720,7 @@ impl RendezvousServer {
                         _ => false,
                     },
                 };
-            let socket_addr = AddrMangle::encode(addr);
-            let relay_server = self.get_relay_server(addr.ip(), peer_addr.ip());
+            let socket_addr = AddrMangle::encode(addr).into();
             if same_intranet {
                 log::debug!(
                     "Fetch local addr {:?} {:?} request from {:?}",
@@ -711,15 +747,44 @@ impl RendezvousServer {
                     ..Default::default()
                 });
             }
-            return Ok((msg_out, Some(peer_addr)));
+            Ok((msg_out, Some(peer_addr)))
         } else {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::ID_NOT_EXIST.into(),
                 ..Default::default()
             });
-            return Ok((msg_out, None));
+            Ok((msg_out, None))
         }
+    }
+
+    #[inline]
+    async fn handle_online_request(
+        &mut self,
+        stream: &mut FramedStream,
+        peers: Vec<String>,
+    ) -> ResultType<()> {
+        let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
+        for (i, peer_id) in peers.iter().enumerate() {
+            if let Some(peer) = self.pm.get_in_memory(peer_id).await {
+                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i32;
+                // bytes index from left to right
+                let states_idx = i / 8;
+                let bit_idx = 7 - i % 8;
+                if elapsed < REG_TIMEOUT {
+                    states[states_idx] |= 0x01 << bit_idx;
+                }
+            }
+        }
+
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_online_response(OnlineResponse {
+            states: states.into(),
+            ..Default::default()
+        });
+        stream.send(&msg_out).await?;
+
+        Ok(())
     }
 
     #[inline]
@@ -767,7 +832,7 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(addr) = to_addr {
-            self.tx.send(Data::Msg(msg, addr))?;
+            self.tx.send(Data::Msg(msg.into(), addr))?;
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
@@ -783,7 +848,7 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
         self.tx.send(Data::Msg(
-            msg,
+            msg.into(),
             match to_addr {
                 Some(addr) => addr,
                 None => addr,
@@ -828,7 +893,7 @@ impl RendezvousServer {
         self.relay_servers = self.relay_servers0.clone();
     }
 
-    fn get_relay_server(&self, pa: IpAddr, pb: IpAddr) -> String {
+    fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
         if self.relay_servers.is_empty() {
             return "".to_owned();
         } else if self.relay_servers.len() == 1 {
@@ -842,8 +907,10 @@ impl RendezvousServer {
     }
 
     async fn check_cmd(&self, cmd: &str) -> String {
+        use std::fmt::Write as _;
+
         let mut res = "".to_owned();
-        let mut fds = cmd.trim().split(" ");
+        let mut fds = cmd.trim().split(' ');
         match fds.next() {
             Some("h") => {
                 res = format!(
@@ -861,7 +928,7 @@ impl RendezvousServer {
                     self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
                 } else {
                     for ip in self.relay_servers.iter() {
-                        res += &format!("{}\n", ip);
+                        let _ = writeln!(res, "{ip}");
                     }
                 }
             }
@@ -877,8 +944,9 @@ impl RendezvousServer {
                 if start < 0 {
                     if let Some(ip) = ip {
                         if let Some((a, b)) = lock.get(ip) {
-                            res += &format!(
-                                "{}/{}s {}/{}s\n",
+                            let _ = writeln!(
+                                res,
+                                "{}/{}s {}/{}s",
                                 a.0,
                                 a.1.elapsed().as_secs(),
                                 b.0.len(),
@@ -903,8 +971,9 @@ impl RendezvousServer {
                             continue;
                         }
                         if let Some((ip, (a, b))) = x {
-                            res += &format!(
-                                "{}: {}/{}s {}/{}s\n",
+                            let _ = writeln!(
+                                res,
+                                "{}: {}/{}s {}/{}s",
                                 ip,
                                 a.0,
                                 a.1.elapsed().as_secs(),
@@ -921,10 +990,10 @@ impl RendezvousServer {
                 res = format!("{}\n", lock.len());
                 let id = fds.next();
                 let mut start = id.map(|x| x.parse::<i32>().unwrap_or(-1)).unwrap_or(-1);
-                if start < 0 || start > 10_000_000 {
+                if !(0..=10_000_000).contains(&start) {
                     if let Some(id) = id {
                         if let Some((tm, ips)) = lock.get(id) {
-                            res += &format!("{}s {:?}\n", tm.elapsed().as_secs(), ips);
+                            let _ = writeln!(res, "{}s {:?}", tm.elapsed().as_secs(), ips);
                         }
                         if fds.next() == Some("-") {
                             lock.remove(id);
@@ -944,7 +1013,7 @@ impl RendezvousServer {
                             continue;
                         }
                         if let Some((id, (tm, ips))) = x {
-                            res += &format!("{}: {}s {:?}\n", id, tm.elapsed().as_secs(), ips,);
+                            let _ = writeln!(res, "{}: {}s {:?}", id, tm.elapsed().as_secs(), ips,);
                         }
                     }
                 }
@@ -958,7 +1027,7 @@ impl RendezvousServer {
                     }
                     self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
                 } else {
-                    res += &format!("ALWAYS_USE_RELAY: {:?}\n", unsafe { ALWAYS_USE_RELAY });
+                    let _ = writeln!(res, "ALWAYS_USE_RELAY: {:?}", unsafe { ALWAYS_USE_RELAY });
                 }
             }
             Some("test-geo" | "tg") => {
@@ -980,8 +1049,8 @@ impl RendezvousServer {
     }
 
     async fn handle_listener2(&self, stream: TcpStream, addr: SocketAddr) {
-        if addr.ip().to_string() == "127.0.0.1" {
-            let rs = self.clone();
+        let mut rs = self.clone();
+        if addr.ip().is_loopback() {
             tokio::spawn(async move {
                 let mut stream = stream;
                 let mut buffer = [0; 64];
@@ -999,34 +1068,31 @@ impl RendezvousServer {
             let mut stream = stream;
             if let Some(Ok(bytes)) = stream.next_timeout(30_000).await {
                 if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
-                    if let Some(rendezvous_message::Union::test_nat_request(_)) = msg_in.union {
-                        let mut msg_out = RendezvousMessage::new();
-                        msg_out.set_test_nat_response(TestNatResponse {
-                            port: addr.port() as _,
-                            ..Default::default()
-                        });
-                        stream.send(&msg_out).await.ok();
+                    match msg_in.union {
+                        Some(rendezvous_message::Union::TestNatRequest(_)) => {
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_test_nat_response(TestNatResponse {
+                                port: addr.port() as _,
+                                ..Default::default()
+                            });
+                            stream.send(&msg_out).await.ok();
+                        }
+                        Some(rendezvous_message::Union::OnlineRequest(or)) => {
+                            allow_err!(rs.handle_online_request(&mut stream, or.peers).await);
+                        }
+                        _ => {}
                     }
                 }
             }
         });
     }
 
-    async fn handle_listener(
-        &self,
-        stream: TcpStream,
-        addr: SocketAddr,
-        key: &str,
-        ws: bool,
-    ) {
+    async fn handle_listener(&self, stream: TcpStream, addr: SocketAddr, key: &str, ws: bool) {
         log::debug!("Tcp connection from {:?}, ws: {}", addr, ws);
         let mut rs = self.clone();
         let key = key.to_owned();
         tokio::spawn(async move {
-            allow_err!(
-                rs.handle_listener_inner(stream, addr, &key, ws)
-                    .await
-            );
+            allow_err!(rs.handle_listener_inner(stream, addr, &key, ws).await);
         });
     }
 
@@ -1044,26 +1110,17 @@ impl RendezvousServer {
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
-                match msg {
-                    tungstenite::Message::Binary(bytes) => {
-                        if !self
-                            .handle_tcp(&bytes, &mut sink, addr, key, ws)
-                            .await
-                        {
-                            break;
-                        }
+                if let tungstenite::Message::Binary(bytes) = msg {
+                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                        break;
                     }
-                    _ => {}
                 }
             }
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self
-                    .handle_tcp(&bytes, &mut sink, addr, key, ws)
-                    .await
-                {
+                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
             }
@@ -1076,9 +1133,9 @@ impl RendezvousServer {
     }
 
     #[inline]
-    async fn get_pk(&mut self, version: &str, id: String) -> Vec<u8> {
-        if version.is_empty() || self.sk.is_none() {
-            Vec::new()
+    async fn get_pk(&mut self, version: &str, id: String) -> Bytes {
+        if version.is_empty() || self.inner.sk.is_none() {
+            Bytes::new()
         } else {
             match self.pm.get(&id).await {
                 Some(peer) => {
@@ -1091,16 +1148,18 @@ impl RendezvousServer {
                         }
                         .write_to_bytes()
                         .unwrap_or_default(),
-                        &self.sk.as_ref().unwrap(),
+                        self.inner.sk.as_ref().unwrap(),
                     )
+                    .into()
                 }
-                _ => Vec::new(),
+                _ => Bytes::new(),
             }
         }
     }
 
     #[inline]
-    fn get_server_sk(&mut self, key: &str) -> String {
+    fn get_server_sk(key: &str) -> (String, Option<sign::SecretKey>) {
+        let mut out_sk = None;
         let mut key = key.to_owned();
         if let Ok(sk) = base64::decode(&key) {
             if sk.len() == sign::SECRETKEYBYTES {
@@ -1108,13 +1167,13 @@ impl RendezvousServer {
                 key = base64::encode(&sk[(sign::SECRETKEYBYTES / 2)..]);
                 let mut tmp = [0u8; sign::SECRETKEYBYTES];
                 tmp[..].copy_from_slice(&sk);
-                self.sk = Some(sign::SecretKey(tmp));
+                out_sk = Some(sign::SecretKey(tmp));
             }
         }
 
         if key.is_empty() || key == "-" || key == "_" {
-            let (pk, sk) = crate::common::gen_sk();
-            self.sk = sk;
+            let (pk, sk) = crate::common::gen_sk(0);
+            out_sk = sk;
             if !key.is_empty() {
                 key = pk;
             } else {
@@ -1126,7 +1185,17 @@ impl RendezvousServer {
             log::info!("Key: {}", key);
             std::env::set_var("KEY_FOR_API", key.clone());
         }
-        key
+        (key, out_sk)
+    }
+
+    #[inline]
+    fn is_lan(&self, addr: SocketAddr) -> bool {
+        if let Some(network) = &self.inner.mask {
+            if let SocketAddr::V4(addr) = addr {
+                return network.contains(*addr.ip());
+            }
+        }
+        false
     }
 }
 
@@ -1135,13 +1204,13 @@ async fn check_relay_servers(rs0: Arc<RelayServers>, tx: Sender) {
     let rs = Arc::new(Mutex::new(Vec::new()));
     for x in rs0.iter() {
         let mut host = x.to_owned();
-        if !host.contains(":") {
-            host = format!("{}:{}", host, hbb_common::config::RELAY_PORT);
+        if !host.contains(':') {
+            host = format!("{}:{}", host, config::RELAY_PORT);
         }
         let rs = rs.clone();
         let x = x.clone();
         futs.push(tokio::spawn(async move {
-            if FramedStream::new(&host, "0.0.0.0:0", CHECK_RELAY_TIMEOUT)
+            if FramedStream::new(&host, None, CHECK_RELAY_TIMEOUT)
                 .await
                 .is_ok()
             {
@@ -1151,7 +1220,7 @@ async fn check_relay_servers(rs0: Arc<RelayServers>, tx: Sender) {
     }
     join_all(futs).await;
     log::debug!("check_relay_servers");
-    let rs = std::mem::replace(&mut *rs.lock().await, Default::default());
+    let rs = std::mem::take(&mut *rs.lock().await);
     if !rs.is_empty() {
         tx.send(Data::RelayServers(rs)).ok();
     }
@@ -1159,7 +1228,7 @@ async fn check_relay_servers(rs0: Arc<RelayServers>, tx: Sender) {
 
 // temp solution to solve udp socket failure
 async fn test_hbbs(addr: SocketAddr) -> ResultType<()> {
-    let mut socket = FramedSocket::new("0.0.0.0:0").await?;
+    let mut socket = FramedSocket::new(config::Config::get_any_listen_addr(addr.is_ipv4())).await?;
     let mut msg_out = RendezvousMessage::new();
     msg_out.set_register_peer(RegisterPeer {
         id: "(:test_hbbs:)".to_owned(),
@@ -1188,13 +1257,6 @@ async fn test_hbbs(addr: SocketAddr) -> ResultType<()> {
 }
 
 #[inline]
-fn distance(a: &(i32, i32), b: &(i32, i32)) -> i32 {
-    let dx = a.0 - b.0;
-    let dy = a.1 - b.1;
-    dx * dx + dy * dy
-}
-
-#[inline]
 async fn send_rk_res(
     socket: &mut FramedSocket,
     addr: SocketAddr,
@@ -1206,4 +1268,23 @@ async fn send_rk_res(
         ..Default::default()
     });
     socket.send(&msg_out, addr).await
+}
+
+async fn create_udp_listener(port: i32, rmem: usize) -> ResultType<FramedSocket> {
+    let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port as _);
+    if let Ok(s) = FramedSocket::new_reuse(&addr, false, rmem).await {
+        log::debug!("listen on udp {:?}", s.local_addr());
+        return Ok(s);
+    }
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port as _);
+    let s = FramedSocket::new_reuse(&addr, false, rmem).await?;
+    log::debug!("listen on udp {:?}", s.local_addr());
+    Ok(s)
+}
+
+#[inline]
+async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
+    let s = listen_any(port as _).await?;
+    log::debug!("listen on tcp {:?}", s.local_addr());
+    Ok(s)
 }
